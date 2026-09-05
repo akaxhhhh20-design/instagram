@@ -1,0 +1,188 @@
+"""
+Instagram Post & Video Emotion Detector
+========================================
+
+This script detects emotions from:
+  1. Instagram post TEXT (caption / comments) using a transformer-based
+     emotion classification model.
+  2. Instagram VIDEO content by extracting frames and running facial
+     expression recognition (FER) on detected faces.
+
+Requirements (install first):
+    pip install instaloader transformers torch deepface opencv-python
+
+NOTE on Instagram access:
+    Instagram's official API (Graph API) only allows access to content you
+    own/manage via a Business/Creator account and requires app review.
+    `instaloader` (used below) scrapes public posts and can break if
+    Instagram changes its site, may hit rate limits, and its use may
+    violate Instagram's Terms of Service depending on your use case.
+    For production / commercial use, prefer the official Instagram Graph
+    API and only analyze content you have permission to access.
+"""
+
+import os
+import cv2
+import instaloader
+from transformers import pipeline
+from collections import Counter
+
+# --------------------------------------------------------------------------
+# 1. TEXT EMOTION DETECTION (captions, comments)
+# --------------------------------------------------------------------------
+
+# Loads a pretrained emotion-classification model (joy, anger, sadness,
+# fear, love, surprise, etc.) the first time this runs (downloads weights).
+text_emotion_classifier = pipeline(
+    "text-classification",
+    model="j-hartmann/emotion-english-distilroberta-base",
+    top_k=None  # return scores for all emotion classes
+)
+
+
+def detect_text_emotion(text: str) -> list:
+    """
+    Returns a list of {label, score} dicts sorted by confidence,
+    e.g. [{'label': 'joy', 'score': 0.87}, ...]
+    """
+    if not text or not text.strip():
+        return []
+    results = text_emotion_classifier(text[:512])  # truncate long captions
+    # pipeline returns a nested list when top_k=None
+    scores = results[0] if isinstance(results[0], list) else results
+    return sorted(scores, key=lambda x: x["score"], reverse=True)
+
+
+# --------------------------------------------------------------------------
+# 2. VIDEO EMOTION DETECTION (facial expressions in frames)
+# --------------------------------------------------------------------------
+
+def detect_video_emotion(video_path: str, sample_every_n_frames: int = 15) -> dict:
+    """
+    Samples frames from a video, runs facial emotion recognition on each
+    frame that contains a detectable face, and returns an aggregated
+    summary of emotions detected across the video.
+    """
+    from deepface import DeepFace  # imported here to avoid slow startup if unused
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file: {video_path}")
+
+    frame_count = 0
+    emotion_tally = Counter()
+    frames_analyzed = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_count % sample_every_n_frames == 0:
+            try:
+                analysis = DeepFace.analyze(
+                    frame,
+                    actions=["emotion"],
+                    enforce_detection=False,  # don't crash if no face found
+                    silent=True,
+                )
+                # analysis can be a list (one entry per face detected)
+                results = analysis if isinstance(analysis, list) else [analysis]
+                for face_result in results:
+                    dominant = face_result.get("dominant_emotion")
+                    if dominant:
+                        emotion_tally[dominant] += 1
+                        frames_analyzed += 1
+            except Exception as e:
+                # No face detected / frame unreadable — skip silently
+                pass
+
+        frame_count += 1
+
+    cap.release()
+
+    if frames_analyzed == 0:
+        return {"summary": "No faces detected in sampled frames", "counts": {}}
+
+    total = sum(emotion_tally.values())
+    percentages = {
+        emotion: round((count / total) * 100, 1)
+        for emotion, count in emotion_tally.most_common()
+    }
+
+    return {
+        "dominant_emotion": emotion_tally.most_common(1)[0][0],
+        "emotion_breakdown_percent": percentages,
+        "frames_analyzed": frames_analyzed,
+    }
+
+
+# --------------------------------------------------------------------------
+# 3. FETCHING AN INSTAGRAM POST (caption + video) VIA INSTALOADER
+# --------------------------------------------------------------------------
+
+def download_instagram_post(shortcode: str, download_dir: str = "downloads") -> dict:
+    """
+    Downloads a public Instagram post (given its shortcode, the string
+    found in a post URL like instagram.com/p/<shortcode>/) and returns
+    the local video path (if any) and the caption text.
+    """
+    os.makedirs(download_dir, exist_ok=True)
+    loader = instaloader.Instaloader(
+        dirname_pattern=download_dir,
+        download_comments=False,
+        save_metadata=False,
+        post_metadata_txt_pattern=""
+    )
+
+    post = instaloader.Post.from_shortcode(loader.context, shortcode)
+    loader.download_post(post, target=shortcode)
+
+    caption = post.caption or ""
+    video_path = None
+    if post.is_video:
+        for fname in os.listdir(os.path.join(download_dir, shortcode)):
+            if fname.endswith(".mp4"):
+                video_path = os.path.join(download_dir, shortcode, fname)
+                break
+
+    return {"caption": caption, "video_path": video_path}
+
+
+# --------------------------------------------------------------------------
+# 4. PUTTING IT ALL TOGETHER
+# --------------------------------------------------------------------------
+
+def analyze_instagram_post(shortcode: str) -> dict:
+    """
+    Full pipeline: downloads a post, then analyzes its caption text
+    and (if present) its video for emotional content.
+    """
+    post_data = download_instagram_post(shortcode)
+    result = {"caption": post_data["caption"]}
+
+    result["text_emotions"] = detect_text_emotion(post_data["caption"])
+
+    if post_data["video_path"]:
+        result["video_emotions"] = detect_video_emotion(post_data["video_path"])
+    else:
+        result["video_emotions"] = "No video in this post"
+
+    return result
+
+
+if __name__ == "__main__":
+    # Example usage:
+    #   Replace with a real public post shortcode, e.g. from
+    #   https://www.instagram.com/p/ABC123xyz/  ->  shortcode = "ABC123xyz"
+    SHORTCODE = "REPLACE_WITH_POST_SHORTCODE"
+
+    analysis = analyze_instagram_post(SHORTCODE)
+
+    print("Caption:", analysis["caption"])
+    print("\nText Emotions:")
+    for emo in analysis["text_emotions"]:
+        print(f"  {emo['label']}: {emo['score']:.2f}")
+
+    print("\nVideo Emotions:")
+    print(analysis["video_emotions"])
